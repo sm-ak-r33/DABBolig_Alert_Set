@@ -1,0 +1,12 @@
+{
+  "name": "dab-lejerbo-apartment-watcher",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "check": "node src/check-apartments.js"
+  },
+  "dependencies": {
+    "playwright": "^1.56.0",
+    "twilio": "^5.10.0"
+  }
+}
