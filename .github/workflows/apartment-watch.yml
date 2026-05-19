@@ -1,0 +1,62 @@
+name: Apartment Watch
+
+on:
+  workflow_dispatch:
+
+  schedule:
+    # Monday-Friday, every 5 minutes from 09:00 to 10:55
+    - cron: "*/5 9-10 * * 1-5"
+      timezone: "Europe/Copenhagen"
+
+    # Monday-Friday, every 5 minutes from 11:00 to 11:30
+    - cron: "0,5,10,15,20,25,30 11 * * 1-5"
+      timezone: "Europe/Copenhagen"
+
+concurrency:
+  group: apartment-watch
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  check-apartments:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Restore previous alert state
+        uses: actions/cache/restore@v4
+        with:
+          path: .state
+          key: apartment-state-${{ github.run_id }}
+          restore-keys: |
+            apartment-state-
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Install Playwright Chromium
+        run: npx playwright install --with-deps chromium
+
+      - name: Check apartment availability
+        env:
+          APARTMENT_URL: ${{ secrets.APARTMENT_URL }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: npm run check
+
+      - name: Save alert state
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: .state
+          key: apartment-state-${{ github.run_id }}
