@@ -18,36 +18,42 @@ function normalizeText(text) {
   return String(text || "").replace(/\s+/g, " ").trim();
 }
 
-function detectAvailability(pageText, cards) {
+function detectAvailability(pageText) {
   const text = normalizeText(pageText);
 
-  const departmentCounts = [...text.matchAll(/\(\s*(\d+)\s+ledige boliger\s*\)/gi)]
-    .map((m) => Number(m[1]))
-    .filter(Number.isFinite);
+  // This is the important line from the page:
+  // "0 Boliger matcher din søgning"
+  const headingMatch = text.match(/(\d+)\s+boliger?\s+matcher\s+din\s+søgning/i);
 
-  const totalFromDepartments = departmentCounts.reduce((sum, n) => sum + n, 0);
+  if (headingMatch) {
+    const count = Number(headingMatch[1]);
 
-  const topMatch =
-    text.match(/(\d+)\s+boliger?\s+matcher/i) ||
-    text.match(/(\d+)\s+boligtyper?\s+matcher/i);
+    return {
+      available: count > 0,
+      count,
+      summary: count > 0
+        ? `${count} boliger matcher din søgning. Open the link to inspect them.`
+        : ""
+    };
+  }
 
-  const totalFromTop = topMatch ? Number(topMatch[1]) : 0;
+  // Fallback only if the normal heading is not found.
+  const noResults =
+    /din søgning gav ikke nogle resultater/i.test(text) ||
+    /prøv at ændre på dine søgeparametre/i.test(text);
 
-  const realCards = cards
-    .map(normalizeText)
-    .filter((card) => {
-      if (!card) return false;
-      if (card.includes("{{")) return false;
-      return /kr\.\/md|indskud|ledige boliger|ledig bolig|værelser|m²/i.test(card);
-    })
-    .slice(0, 8);
-
-  const count = Math.max(totalFromDepartments, totalFromTop, realCards.length);
+  if (noResults) {
+    return {
+      available: false,
+      count: 0,
+      summary: ""
+    };
+  }
 
   return {
-    available: count > 0,
-    count,
-    summary: realCards.join("\n\n")
+    available: false,
+    count: 0,
+    summary: ""
   };
 }
 
@@ -114,28 +120,17 @@ async function main() {
 
     await page.waitForTimeout(3000);
 
-    const data = await page.evaluate(() => {
-      const bodyText = document.body.innerText || "";
+    const pageText = await page.locator("body").innerText();
 
-      const possibleCards = Array.from(
-        document.querySelectorAll("article, li, a, section, div")
-      )
-        .map((el) => el.innerText || "")
-        .filter((text) =>
-          /kr\.\/md|Indskud|ledige boliger|ledig bolig|værelser|m²/i.test(text)
-        )
-        .slice(0, 30);
-
-      return {
-        bodyText,
-        cards: possibleCards
-      };
-    });
-
-    const result = detectAvailability(data.bodyText, data.cards);
+    const result = detectAvailability(pageText);
 
     console.log(`Available: ${result.available}`);
     console.log(`Detected count: ${result.count}`);
+
+    if (!result.available) {
+      console.log("No available apartments detected. No Telegram message sent.");
+      return;
+    }
 
     fs.mkdirSync(STATE_DIR, { recursive: true });
 
@@ -146,26 +141,19 @@ async function main() {
 
     fs.writeFileSync(STATE_FILE, currentHash);
 
-    if (!result.available) {
-      console.log("No available apartments detected.");
-      return;
-    }
-
     if (currentHash === previousHash) {
       console.log("Same availability already reported. Not sending duplicate Telegram alert.");
       return;
     }
 
     const message = [
-      `🏠 DAB-Lejerbo alert`,
-      ``,
-      `${result.count} possible available apartment(s) found.`,
-      ``,
-      result.summary
-        ? result.summary.slice(0, 1500)
-        : "Open the search link to inspect the results.",
-      ``,
-      `Link:`,
+      "🏠 DAB-Lejerbo alert",
+      "",
+      `${result.count} available apartment(s) found.`,
+      "",
+      result.summary,
+      "",
+      "Link:",
       APARTMENT_URL
     ].join("\n");
 
