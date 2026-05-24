@@ -2,13 +2,10 @@ name: Apartment Watch
 
 on:
   workflow_dispatch:
-  schedule:
-    # Monday-Friday, every 5 minutes from 09:00 to 10:55
-    - cron: "*/5 9-10 * * 1-5"
-      timezone: "Europe/Copenhagen"
 
-    # Monday-Friday, every 5 minutes from 11:00 to 11:30
-    - cron: "0,5,10,15,20,25,30 11 * * 1-5"
+  schedule:
+    # Monday-Friday, every 5 minutes from 07:00 to 23:55 Europe/Copenhagen time
+    - cron: "*/5 7-23 * * 1-5"
       timezone: "Europe/Copenhagen"
 
 concurrency:
@@ -49,7 +46,9 @@ jobs:
 
       - name: Check apartment availability
         env:
-          APARTMENT_URL: ${{ secrets.APARTMENT_URL }}
+          APARTMENT_URL: https://dab-lejerbo.dk/boligsoegende/tidsbegraensede-boliger/
+          MIN_POSTCODE: "1000"
+          MAX_POSTCODE: "2999"
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: npm run check
