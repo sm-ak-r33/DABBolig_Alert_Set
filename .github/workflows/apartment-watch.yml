@@ -2,7 +2,6 @@ name: Apartment Watch
 
 on:
   workflow_dispatch:
-
   schedule:
     # Monday-Friday, every 5 minutes from 09:00 to 10:55
     - cron: "*/5 9-10 * * 1-5"
@@ -40,9 +39,10 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: 20
+          cache: npm
 
       - name: Install dependencies
-        run: npm install
+        run: npm ci
 
       - name: Install Playwright Chromium
         run: npx playwright install --with-deps chromium
