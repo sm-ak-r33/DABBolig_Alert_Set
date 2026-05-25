@@ -3,10 +3,10 @@ name: Apartment Watch
 on:
   workflow_dispatch:
 
-  schedule:
-    # Monday-Friday, every 5 minutes from 07:00 to 23:55 Europe/Copenhagen time
-    - cron: "*/5 7-23 * * 1-5"
-      timezone: "Europe/Copenhagen"
+  # schedule:
+  #   # Monday-Friday, every 5 minutes from 07:00 to 23:55 Europe/Copenhagen time
+  #   - cron: "*/5 7-23 * * 1-5"
+  #     timezone: "Europe/Copenhagen"
 
 concurrency:
   group: apartment-watch
