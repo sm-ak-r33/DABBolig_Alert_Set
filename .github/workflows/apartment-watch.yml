@@ -53,6 +53,9 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          # TEST ONLY:
+          POSTCODE_TEST: "1"
+          # FORCE_INITIAL_SNAPSHOT: "1"
         run: npm run check
 
       - name: Save alert state
@@ -61,3 +64,6 @@ jobs:
         with:
           path: .state
           key: apartment-state-${{ github.run_id }}
+
+      
+
