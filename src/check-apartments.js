@@ -14,8 +14,11 @@ const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 const MIN_POSTCODE = Number(process.env.MIN_POSTCODE || 1000);
 const MAX_POSTCODE = Number(process.env.MAX_POSTCODE || 3999);
 
+const FORCE_INITIAL_SNAPSHOT = process.env.FORCE_INITIAL_SNAPSHOT === "1";
+
 const STATE_DIR = ".state";
 const STATE_FILE = path.join(STATE_DIR, "seen-housing-ids.json");
+const STATE_VERSION = 2;
 
 function hash(value) {
   return crypto.createHash("sha256").update(String(value)).digest("hex");
@@ -82,55 +85,79 @@ function titleFromText(text) {
 
 function makeListingId(listing) {
   /*
-    IMPORTANT:
-    Do NOT only use url + postcode.
-    DAB/Lejerbo can show multiple listings from the same generic page URL,
-    so url + postcode can accidentally hide a new apartment.
+    Do NOT use only URL + postcode.
+    Multiple apartments can appear on the same generic DAB-Lejerbo page.
+    This ID uses the title, postcode, listing text, and URL.
   */
   const stablePart = [
     listing.title,
     listing.postcodes.join(","),
-    normalizeText(listing.text).slice(0, 1200),
+    normalizeText(listing.text).slice(0, 1500),
     listing.url || APARTMENT_URL,
   ].join("|");
 
   return hash(stablePart.toLowerCase());
 }
 
-function loadSeenIds() {
+function loadState() {
   if (!fs.existsSync(STATE_FILE)) {
-    return new Set();
+    return {
+      seenIds: new Set(),
+      hasSentInitialSnapshot: false,
+    };
   }
 
   try {
     const raw = fs.readFileSync(STATE_FILE, "utf8");
     const parsed = JSON.parse(raw);
 
+    /*
+      Old state files from your previous script only had seen IDs.
+      We intentionally treat old state as NOT initialized,
+      so your next run sends the full first snapshot.
+    */
     if (Array.isArray(parsed)) {
-      return new Set(parsed);
+      return {
+        seenIds: new Set(parsed),
+        hasSentInitialSnapshot: false,
+      };
     }
 
     if (Array.isArray(parsed.seenIds)) {
-      return new Set(parsed.seenIds);
+      return {
+        seenIds: new Set(parsed.seenIds),
+        hasSentInitialSnapshot:
+          parsed.stateVersion === STATE_VERSION &&
+          parsed.hasSentInitialSnapshot === true,
+      };
     }
 
-    return new Set();
+    return {
+      seenIds: new Set(),
+      hasSentInitialSnapshot: false,
+    };
   } catch (error) {
     console.warn("Could not read previous state. Starting with empty state.");
-    return new Set();
+
+    return {
+      seenIds: new Set(),
+      hasSentInitialSnapshot: false,
+    };
   }
 }
 
-function saveSeenIds(seenIds) {
+function saveState(seenIds, hasSentInitialSnapshot) {
   fs.mkdirSync(STATE_DIR, { recursive: true });
 
-  const ids = [...seenIds].slice(-1000);
+  const ids = [...seenIds].slice(-2000);
 
   fs.writeFileSync(
     STATE_FILE,
     JSON.stringify(
       {
+        stateVersion: STATE_VERSION,
         updatedAt: new Date().toISOString(),
+        hasSentInitialSnapshot,
         seenIds: ids,
       },
       null,
@@ -194,7 +221,7 @@ async function extractListingsFromPage(page) {
       function looksLikeHousingText(text) {
         const value = normalize(text).toLowerCase();
 
-        if (value.length < 20 || value.length > 2500) {
+        if (value.length < 20 || value.length > 8000) {
           return false;
         }
 
@@ -202,7 +229,7 @@ async function extractListingsFromPage(page) {
           return false;
         }
 
-        return /bolig|lejemål|lejlighed|værelse|rum|m2|m²|husleje|kr\.?|indskud|depositum|overtagelse|adresse|tidsbegrænset|fleksible regler|udlejning/i.test(
+        return /bolig|lejemål|lejlighed|værelse|rum|m2|m²|kvm|husleje|leje|kr\.?|kroner|indskud|depositum|overtagelse|adresse|tidsbegrænset|tidsbegraenset|fleksible regler|udlejning|for rent/i.test(
           value
         );
       }
@@ -210,7 +237,7 @@ async function extractListingsFromPage(page) {
       function nearestUsefulNode(node) {
         return (
           node.closest(
-            "article, li, [class*='card'], [class*='result'], [class*='bolig'], [class*='apartment'], [class*='property'], [class*='teaser'], [class*='item'], [class*='listing']"
+            "article, li, [class*='card'], [class*='result'], [class*='bolig'], [class*='apartment'], [class*='property'], [class*='teaser'], [class*='item'], [class*='listing'], section"
           ) || node
         );
       }
@@ -249,6 +276,37 @@ async function extractListingsFromPage(page) {
         });
       }
 
+      /*
+        Fallback:
+        If the page text contains a postcode but the DOM card selector failed,
+        create rough snippets around postcode matches.
+      */
+      if (results.length === 0) {
+        const bodyText = normalize(document.body.innerText || document.body.textContent);
+        const regex = /(?:^|\D)(\d{4})(?=\D|$)/g;
+        let match;
+
+        while ((match = regex.exec(bodyText)) !== null) {
+          const postcode = Number(match[1]);
+
+          if (postcode < minPostcode || postcode > maxPostcode) {
+            continue;
+          }
+
+          const start = Math.max(0, match.index - 700);
+          const end = Math.min(bodyText.length, match.index + 1400);
+          const snippet = normalize(bodyText.slice(start, end));
+
+          if (looksLikeHousingText(snippet)) {
+            results.push({
+              title: snippet.slice(0, 120),
+              text: snippet,
+              url: window.location.href,
+            });
+          }
+        }
+      }
+
       return results;
     },
     {
@@ -260,40 +318,84 @@ async function extractListingsFromPage(page) {
   return dedupeListings(rawListings);
 }
 
-function buildTelegramMessage(newListings) {
+function buildListingsMessage(title, listings) {
   const lines = [
-    "🏠 New DAB-Lejerbo housing match",
+    title,
     "",
-    `Found ${newListings.length} new matching listing(s) in postcode range ${MIN_POSTCODE}-${MAX_POSTCODE}.`,
+    `Postcode range: ${MIN_POSTCODE}-${MAX_POSTCODE}`,
+    `Found: ${listings.length} matching listing(s)`,
     "",
   ];
 
-  newListings.slice(0, 10).forEach((listing, index) => {
+  listings.forEach((listing, index) => {
+    lines.push(`━━━━━━━━━━━━━━━━━━━━`);
     lines.push(`${index + 1}. ${listing.title}`);
     lines.push(`Postcode(s): ${listing.postcodes.join(", ")}`);
+    lines.push("");
 
-    const shortText = normalizeText(listing.text).slice(0, 700);
+    const shortText = normalizeText(listing.text).slice(0, 1200);
 
     if (shortText) {
       lines.push(shortText);
+      lines.push("");
     }
 
     if (listing.url) {
-      lines.push(listing.url);
+      lines.push(`Link: ${listing.url}`);
+      lines.push("");
     }
-
-    lines.push("");
   });
-
-  if (newListings.length > 10) {
-    lines.push(`And ${newListings.length - 10} more matching listing(s).`);
-    lines.push("");
-  }
 
   lines.push("Source:");
   lines.push(APARTMENT_URL);
 
   return lines.join("\n");
+}
+
+function buildEmptyFirstRunMessage() {
+  return [
+    "✅ DAB-Lejerbo apartment watcher is running",
+    "",
+    `First snapshot completed.`,
+    `Postcode range: ${MIN_POSTCODE}-${MAX_POSTCODE}`,
+    "",
+    "Found 0 matching listings on the page right now.",
+    "",
+    "This means Telegram works, but the scraper/page did not return any matching apartment details in this run.",
+    "",
+    "Source:",
+    APARTMENT_URL,
+  ].join("\n");
+}
+
+function splitTelegramMessage(message, maxLength = 3800) {
+  if (message.length <= maxLength) {
+    return [message];
+  }
+
+  const chunks = [];
+  let remaining = message;
+
+  while (remaining.length > maxLength) {
+    let splitAt = remaining.lastIndexOf("\n━━━━━━━━━━━━━━━━━━━━", maxLength);
+
+    if (splitAt < 500) {
+      splitAt = remaining.lastIndexOf("\n", maxLength);
+    }
+
+    if (splitAt < 500) {
+      splitAt = maxLength;
+    }
+
+    chunks.push(remaining.slice(0, splitAt).trim());
+    remaining = remaining.slice(splitAt).trim();
+  }
+
+  if (remaining.length > 0) {
+    chunks.push(remaining);
+  }
+
+  return chunks;
 }
 
 async function sendTelegramMessage(message) {
@@ -303,29 +405,38 @@ async function sendTelegramMessage(message) {
     return;
   }
 
-  const response = await fetch(
-    `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`,
-    {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        chat_id: TELEGRAM_CHAT_ID,
-        text: message.slice(0, 3900),
-        disable_web_page_preview: false,
-      }),
+  const chunks = splitTelegramMessage(message);
+
+  for (let i = 0; i < chunks.length; i += 1) {
+    const text =
+      chunks.length === 1
+        ? chunks[i]
+        : `${chunks[i]}\n\nPart ${i + 1}/${chunks.length}`;
+
+    const response = await fetch(
+      `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          chat_id: TELEGRAM_CHAT_ID,
+          text,
+          disable_web_page_preview: false,
+        }),
+      }
+    );
+
+    const result = await response.json();
+
+    if (!response.ok || !result.ok) {
+      console.error(result);
+      throw new Error("Telegram message failed.");
     }
-  );
-
-  const result = await response.json();
-
-  if (!response.ok || !result.ok) {
-    console.error(result);
-    throw new Error("Telegram message failed.");
   }
 
-  console.log("Telegram message sent.");
+  console.log(`Telegram message sent in ${chunks.length} part(s).`);
 }
 
 async function main() {
@@ -335,7 +446,7 @@ async function main() {
     const page = await browser.newPage({
       viewport: {
         width: 1440,
-        height: 1200,
+        height: 1400,
       },
     });
 
@@ -355,6 +466,7 @@ async function main() {
       "Tillad alle",
       "OK",
       "Accept all",
+      "Allow all",
     ]) {
       await page
         .getByRole("button", { name: new RegExp(label, "i") })
@@ -364,52 +476,98 @@ async function main() {
 
     await page.waitForTimeout(3000);
 
+    /*
+      Scroll down and up to trigger lazy-loaded content.
+    */
+    await page.mouse.wheel(0, 1800).catch(() => {});
+    await page.waitForTimeout(1500);
+    await page.mouse.wheel(0, -1800).catch(() => {});
+    await page.waitForTimeout(1500);
+
     const listings = await extractListingsFromPage(page);
 
     console.log(
       `Matching listings in postcode range ${MIN_POSTCODE}-${MAX_POSTCODE}: ${listings.length}`
     );
 
-    if (listings.length === 0) {
-      console.log("No matching listings found. No Telegram message sent.");
+    const state = loadState();
+
+    const isInitialSnapshot =
+      FORCE_INITIAL_SNAPSHOT || state.hasSentInitialSnapshot === false;
+
+    /*
+      FIRST RUN:
+      Send everything found.
+      If nothing is found, still send a Telegram message so you know the bot works.
+    */
+    if (isInitialSnapshot) {
+      console.log("Initial snapshot mode: sending all current matching listings.");
+
+      if (listings.length === 0) {
+        await sendTelegramMessage(buildEmptyFirstRunMessage());
+        saveState(state.seenIds, true);
+        console.log("Saved initial snapshot state with 0 listings.");
+        return;
+      }
+
+      const message = buildListingsMessage(
+        "🏠 Initial DAB-Lejerbo housing snapshot",
+        listings
+      );
+
+      await sendTelegramMessage(message);
+
+      for (const listing of listings) {
+        state.seenIds.add(listing.id);
+      }
+
+      saveState(state.seenIds, true);
+
+      console.log(
+        `Initial snapshot sent. Saved ${state.seenIds.size} seen listing id(s).`
+      );
+
       return;
     }
 
-    const seenIds = loadSeenIds();
-
     /*
-      FIX:
-      The old version skipped Telegram when seenIds was empty.
-      That caused the exact problem you saw:
-      the first detected housing was saved as "seen" without alerting.
-
-      Now:
-      - If state is empty, all current matching listings are treated as new.
-      - If state exists, only unseen listings are sent.
+      NEXT RUNS:
+      Only send listings that were not seen before.
     */
-    const newListings =
-      seenIds.size === 0
-        ? listings
-        : listings.filter((listing) => !seenIds.has(listing.id));
+    if (listings.length === 0) {
+      console.log("No matching listings found. No Telegram message sent.");
+      saveState(state.seenIds, true);
+      return;
+    }
+
+    const newListings = listings.filter((listing) => !state.seenIds.has(listing.id));
 
     if (newListings.length === 0) {
       console.log("No new matching listings. No Telegram message sent.");
+
+      /*
+        Save current state again, keeping the new state format.
+      */
+      saveState(state.seenIds, true);
       return;
     }
 
     console.log(`New listings to alert: ${newListings.length}`);
 
-    const message = buildTelegramMessage(newListings);
+    const message = buildListingsMessage(
+      "🚨 New DAB-Lejerbo housing update",
+      newListings
+    );
 
     await sendTelegramMessage(message);
 
     for (const listing of listings) {
-      seenIds.add(listing.id);
+      state.seenIds.add(listing.id);
     }
 
-    saveSeenIds(seenIds);
+    saveState(state.seenIds, true);
 
-    console.log(`Saved ${seenIds.size} seen listing id(s).`);
+    console.log(`Saved ${state.seenIds.size} seen listing id(s).`);
   } finally {
     await browser.close();
   }
