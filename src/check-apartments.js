@@ -12,13 +12,14 @@ const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 
 const MIN_POSTCODE = Number(process.env.MIN_POSTCODE || 1000);
-const MAX_POSTCODE = Number(process.env.MAX_POSTCODE || 3999);
+const MAX_POSTCODE = Number(process.env.MAX_POSTCODE || 2999);
 
+const POSTCODE_TEST = process.env.POSTCODE_TEST === "1";
 const FORCE_INITIAL_SNAPSHOT = process.env.FORCE_INITIAL_SNAPSHOT === "1";
 
 const STATE_DIR = ".state";
 const STATE_FILE = path.join(STATE_DIR, "seen-housing-ids.json");
-const STATE_VERSION = 2;
+const STATE_VERSION = 3;
 
 function hash(value) {
   return crypto.createHash("sha256").update(String(value)).digest("hex");
@@ -35,20 +36,197 @@ function cleanLines(text) {
     .filter(Boolean);
 }
 
-function extractPostcodes(text) {
-  const matches = [];
-  const regex = /(?:^|\D)(\d{4})(?=\D|$)/g;
+function isInTargetRange(postcode) {
+  return postcode >= MIN_POSTCODE && postcode <= MAX_POSTCODE;
+}
+
+/*
+  IMPORTANT:
+  This is the new strict postcode extractor.
+
+  It only accepts a postcode when it looks like:
+    2635 Ishøj Husleje...
+    2830 Virum Husleje...
+    3460 Birkerød Husleje...
+    4700 Næstved Husleje...
+
+  It does NOT accept:
+    2026 – 2027
+    15-05-2026
+    31-10-2027
+*/
+function extractPostcodeCityAnchors(pageText) {
+  const text = normalizeText(pageText);
+
+  const badCityWords = new Set([
+    "januar",
+    "februar",
+    "marts",
+    "april",
+    "maj",
+    "juni",
+    "juli",
+    "august",
+    "september",
+    "oktober",
+    "november",
+    "december",
+    "jan",
+    "feb",
+    "mar",
+    "apr",
+    "jun",
+    "jul",
+    "aug",
+    "sep",
+    "okt",
+    "nov",
+    "dec",
+    "til",
+    "until",
+    "as",
+    "soon",
+    "possible",
+  ]);
+
+  const cityPattern =
+    "[\\p{L}][\\p{L}.'-]*(?:\\s+[\\p{L}][\\p{L}.'-]*){0,3}";
+
+  const rentOrHousingKeyword =
+    "(?:Husleje:?|Rent:?|Indskud:?|Deposit:?|Etagebolig|Rækkehus|Apartment|Lejlighed|Bolig|Værelse|Room|FOR RENT|For rent)";
+
+  const postcodeRegex = new RegExp(
+    `\\b([1-9]\\d{3})\\s+(${cityPattern})(?=\\s+${rentOrHousingKeyword}\\b)`,
+    "giu"
+  );
+
+  const anchors = [];
   let match;
 
-  while ((match = regex.exec(String(text || ""))) !== null) {
+  while ((match = postcodeRegex.exec(text)) !== null) {
     const postcode = Number(match[1]);
+    const city = normalizeText(match[2]);
 
-    if (postcode >= MIN_POSTCODE && postcode <= MAX_POSTCODE) {
-      matches.push(postcode);
+    if (postcode < 1000 || postcode > 9999) {
+      continue;
+    }
+
+    const cityLower = city.toLowerCase();
+
+    if (badCityWords.has(cityLower)) {
+      continue;
+    }
+
+    const before = text.slice(Math.max(0, match.index - 100), match.index);
+    const localContext = text.slice(
+      Math.max(0, match.index - 60),
+      Math.min(text.length, match.index + 120)
+    );
+
+    /*
+      Extra guard:
+      If the postcode candidate is directly inside rental-period/date text,
+      ignore it.
+    */
+    const looksLikeDateContext =
+      /Udlejningsperiode|Rental period|Lejeperiode/i.test(before) &&
+      /\d{1,2}[./-]\d{1,2}[./-]\d{4}|\d{4}\s*[–-]\s*\d{1,2}|\d{4}\s*(til|to|until)/i.test(
+        localContext
+      );
+
+    if (looksLikeDateContext) {
+      continue;
+    }
+
+    anchors.push({
+      postcode,
+      city,
+      index: match.index,
+      matchedText: match[0],
+    });
+  }
+
+  return anchors;
+}
+
+function extractAvailablePostcodesFromText(pageText) {
+  const anchors = extractPostcodeCityAnchors(pageText);
+  const byKey = new Map();
+
+  for (const anchor of anchors) {
+    const key = `${anchor.postcode} ${anchor.city}`;
+
+    if (!byKey.has(key)) {
+      byKey.set(key, {
+        postcode: anchor.postcode,
+        city: anchor.city,
+        count: 0,
+        examples: [],
+      });
+    }
+
+    const item = byKey.get(key);
+    item.count += 1;
+
+    if (item.examples.length < 2) {
+      const text = normalizeText(pageText);
+      const example = text.slice(anchor.index, anchor.index + 240);
+      item.examples.push(example);
     }
   }
 
-  return [...new Set(matches)];
+  return [...byKey.values()].sort((a, b) => {
+    if (a.postcode !== b.postcode) {
+      return a.postcode - b.postcode;
+    }
+
+    return a.city.localeCompare(b.city, "da");
+  });
+}
+
+function buildPostcodeTestMessage(postcodeItems) {
+  const inRangeItems = postcodeItems.filter((item) => isInTargetRange(item.postcode));
+
+  const lines = [
+    "🧪 DAB-Lejerbo postcode extraction test",
+    "",
+    `Target range: ${MIN_POSTCODE}-${MAX_POSTCODE}`,
+    `Strict postcode/city matches found: ${postcodeItems.length}`,
+    `Matches inside target range: ${inRangeItems.length}`,
+    "",
+  ];
+
+  if (postcodeItems.length === 0) {
+    lines.push("No strict postcode/city matches found.");
+    lines.push("");
+    lines.push(
+      "This means either the page did not load housing text, or the postcode rule is too strict."
+    );
+    lines.push("");
+    lines.push("Source:");
+    lines.push(APARTMENT_URL);
+    return lines.join("\n");
+  }
+
+  lines.push("Available postcode/city pairs found:");
+  lines.push("");
+
+  for (const item of postcodeItems) {
+    const marker = isInTargetRange(item.postcode) ? "✅" : "⬜";
+
+    lines.push(`${marker} ${item.postcode} ${item.city} — ${item.count} match(es)`);
+
+    for (const example of item.examples) {
+      lines.push(`   Example: ${example}`);
+    }
+
+    lines.push("");
+  }
+
+  lines.push("Source:");
+  lines.push(APARTMENT_URL);
+
+  return lines.join("\n");
 }
 
 function shouldSkipText(text) {
@@ -80,23 +258,192 @@ function titleFromText(text) {
         !/^https?:\/\//i.test(line)
     ) || lines[0];
 
-  return normalizeText(usefulLine || "Matching housing listing").slice(0, 140);
+  return normalizeText(usefulLine || "Matching housing listing").slice(0, 160);
+}
+
+function guessListingStart(text, postcodeIndex) {
+  const searchStart = Math.max(0, postcodeIndex - 260);
+  const before = text.slice(searchStart, postcodeIndex);
+
+  const boundaryPatterns = [
+    "Læs mere og se billeder af afdelingen",
+    "Read more and see pictures of the department",
+    "OBS!",
+    "Udlejningsperiode:",
+    "Udlejningsperiode",
+    "Rental period:",
+    "Rental period",
+  ];
+
+  let bestLocalIndex = -1;
+  let bestBoundary = "";
+
+  for (const boundary of boundaryPatterns) {
+    const idx = before.lastIndexOf(boundary);
+
+    if (idx > bestLocalIndex) {
+      bestLocalIndex = idx;
+      bestBoundary = boundary;
+    }
+  }
+
+  if (bestLocalIndex >= 0) {
+    let absolute = searchStart + bestLocalIndex + bestBoundary.length;
+
+    /*
+      After a previous rental period, skip a likely date tail before the next address.
+    */
+    const tail = text.slice(absolute, postcodeIndex);
+    const dateTailMatch = tail.match(
+      /(?:\d{1,2}[./-]\d{1,2}[./-]\d{4}|\d{1,2}\.\s*[A-Za-zÆØÅæøå]+\s+\d{4}|\d{4})[^A-Za-zÆØÅæøå]{0,20}/
+    );
+
+    if (dateTailMatch && dateTailMatch.index !== undefined) {
+      const maybeStart = absolute + dateTailMatch.index + dateTailMatch[0].length;
+
+      if (maybeStart < postcodeIndex) {
+        absolute = maybeStart;
+      }
+    }
+
+    return Math.max(0, absolute);
+  }
+
+  /*
+    Fallback: start a bit before postcode so the address is included.
+  */
+  return searchStart;
+}
+
+function guessListingEnd(text, nextPostcodeIndex) {
+  if (nextPostcodeIndex === -1) {
+    const readMore = text.indexOf(
+      "Læs mere og se billeder af afdelingen",
+      nextPostcodeIndex
+    );
+
+    return readMore >= 0 ? readMore : text.length;
+  }
+
+  /*
+    End before the next listing's address.
+  */
+  return Math.max(0, nextPostcodeIndex - 180);
+}
+
+function extractTitleFromListing(listingText, postcode, city) {
+  const normalized = normalizeText(listingText);
+  const postcodeCity = `${postcode} ${city}`;
+  const idx = normalized.indexOf(postcodeCity);
+
+  if (idx > 0) {
+    const beforePostcode = normalized.slice(0, idx).trim();
+
+    const cleaned = beforePostcode
+      .replace(/^[-–—.,\s]+/, "")
+      .replace(/^(Læs mere og se billeder af afdelingen|Read more and see pictures of the department)\s*/i, "")
+      .trim();
+
+    if (cleaned.length >= 5) {
+      return `${cleaned.slice(-120)}, ${postcodeCity}`;
+    }
+  }
+
+  return titleFromText(normalized);
 }
 
 function makeListingId(listing) {
-  /*
-    Do NOT use only URL + postcode.
-    Multiple apartments can appear on the same generic DAB-Lejerbo page.
-    This ID uses the title, postcode, listing text, and URL.
-  */
   const stablePart = [
     listing.title,
-    listing.postcodes.join(","),
-    normalizeText(listing.text).slice(0, 1500),
+    listing.postcode,
+    listing.city,
+    normalizeText(listing.text).slice(0, 1200),
     listing.url || APARTMENT_URL,
   ].join("|");
 
   return hash(stablePart.toLowerCase());
+}
+
+function extractListingsFromText(pageText) {
+  const text = normalizeText(pageText);
+  const anchors = extractPostcodeCityAnchors(text)
+    .filter((anchor) => isInTargetRange(anchor.postcode))
+    .sort((a, b) => a.index - b.index);
+
+  const rawListings = [];
+
+  for (let i = 0; i < anchors.length; i += 1) {
+    const anchor = anchors[i];
+    const nextAnchor = anchors[i + 1];
+
+    const start = guessListingStart(text, anchor.index);
+    const end = nextAnchor ? guessListingStart(text, nextAnchor.index) : text.length;
+
+    let listingText = normalizeText(text.slice(start, end));
+
+    /*
+      Stop after "Læs mere..." when the next department begins.
+    */
+    const readMorePatterns = [
+      "Læs mere og se billeder af afdelingen",
+      "Read more and see pictures of the department",
+    ];
+
+    for (const pattern of readMorePatterns) {
+      const idx = listingText.indexOf(pattern);
+
+      if (idx > 80) {
+        listingText = listingText.slice(0, idx).trim();
+      }
+    }
+
+    if (!listingText || shouldSkipText(listingText)) {
+      continue;
+    }
+
+    const title = extractTitleFromListing(
+      listingText,
+      anchor.postcode,
+      anchor.city
+    );
+
+    const listing = {
+      title,
+      text: listingText,
+      url: APARTMENT_URL,
+      postcode: anchor.postcode,
+      city: anchor.city,
+      postcodes: [anchor.postcode],
+    };
+
+    listing.id = makeListingId(listing);
+
+    rawListings.push(listing);
+  }
+
+  /*
+    Dedupe by ID.
+  */
+  const byId = new Map();
+
+  for (const listing of rawListings) {
+    const existing = byId.get(listing.id);
+
+    if (!existing || listing.text.length > existing.text.length) {
+      byId.set(listing.id, listing);
+    }
+  }
+
+  return [...byId.values()];
+}
+
+async function extractListingsFromPage(page) {
+  const bodyText = await page
+    .locator("body")
+    .innerText({ timeout: 15000 })
+    .catch(async () => page.content());
+
+  return extractListingsFromText(bodyText);
 }
 
 function loadState() {
@@ -111,11 +458,6 @@ function loadState() {
     const raw = fs.readFileSync(STATE_FILE, "utf8");
     const parsed = JSON.parse(raw);
 
-    /*
-      Old state files from your previous script only had seen IDs.
-      We intentionally treat old state as NOT initialized,
-      so your next run sends the full first snapshot.
-    */
     if (Array.isArray(parsed)) {
       return {
         seenIds: new Set(parsed),
@@ -166,158 +508,6 @@ function saveState(seenIds, hasSentInitialSnapshot) {
   );
 }
 
-function dedupeListings(rawListings) {
-  const byId = new Map();
-
-  for (const raw of rawListings) {
-    const text = normalizeText(raw.text);
-    const postcodes = extractPostcodes(text);
-
-    if (!text || postcodes.length === 0 || shouldSkipText(text)) {
-      continue;
-    }
-
-    const listing = {
-      title: titleFromText(raw.title || text),
-      text,
-      url: raw.url || APARTMENT_URL,
-      postcodes,
-    };
-
-    listing.id = makeListingId(listing);
-
-    const existing = byId.get(listing.id);
-
-    if (!existing || listing.text.length > existing.text.length) {
-      byId.set(listing.id, listing);
-    }
-  }
-
-  return [...byId.values()];
-}
-
-async function extractListingsFromPage(page) {
-  const rawListings = await page.evaluate(
-    ({ minPostcode, maxPostcode }) => {
-      function normalize(value) {
-        return String(value || "").replace(/\s+/g, " ").trim();
-      }
-
-      function hasMatchingPostcode(text) {
-        const regex = /(?:^|\D)(\d{4})(?=\D|$)/g;
-        let match;
-
-        while ((match = regex.exec(String(text || ""))) !== null) {
-          const postcode = Number(match[1]);
-
-          if (postcode >= minPostcode && postcode <= maxPostcode) {
-            return true;
-          }
-        }
-
-        return false;
-      }
-
-      function looksLikeHousingText(text) {
-        const value = normalize(text).toLowerCase();
-
-        if (value.length < 20 || value.length > 8000) {
-          return false;
-        }
-
-        if (!hasMatchingPostcode(value)) {
-          return false;
-        }
-
-        return /bolig|lejemål|lejlighed|værelse|rum|m2|m²|kvm|husleje|leje|kr\.?|kroner|indskud|depositum|overtagelse|adresse|tidsbegrænset|tidsbegraenset|fleksible regler|udlejning|for rent/i.test(
-          value
-        );
-      }
-
-      function nearestUsefulNode(node) {
-        return (
-          node.closest(
-            "article, li, [class*='card'], [class*='result'], [class*='bolig'], [class*='apartment'], [class*='property'], [class*='teaser'], [class*='item'], [class*='listing'], section"
-          ) || node
-        );
-      }
-
-      const root = document.querySelector("main") || document.body;
-
-      const nodes = [
-        ...root.querySelectorAll("article, li, a[href], div, section, [class]"),
-      ];
-
-      const results = [];
-
-      for (const node of nodes) {
-        if (node.closest("header, footer, nav")) {
-          continue;
-        }
-
-        const usefulNode = nearestUsefulNode(node);
-        const text = normalize(usefulNode.innerText || usefulNode.textContent);
-
-        if (!looksLikeHousingText(text)) {
-          continue;
-        }
-
-        const anchor = usefulNode.matches("a[href]")
-          ? usefulNode
-          : usefulNode.querySelector("a[href]");
-
-        const href = anchor ? anchor.getAttribute("href") : "";
-        const url = href ? new URL(href, window.location.href).href : "";
-
-        results.push({
-          title: normalize(anchor?.innerText || ""),
-          text,
-          url,
-        });
-      }
-
-      /*
-        Fallback:
-        If the page text contains a postcode but the DOM card selector failed,
-        create rough snippets around postcode matches.
-      */
-      if (results.length === 0) {
-        const bodyText = normalize(document.body.innerText || document.body.textContent);
-        const regex = /(?:^|\D)(\d{4})(?=\D|$)/g;
-        let match;
-
-        while ((match = regex.exec(bodyText)) !== null) {
-          const postcode = Number(match[1]);
-
-          if (postcode < minPostcode || postcode > maxPostcode) {
-            continue;
-          }
-
-          const start = Math.max(0, match.index - 700);
-          const end = Math.min(bodyText.length, match.index + 1400);
-          const snippet = normalize(bodyText.slice(start, end));
-
-          if (looksLikeHousingText(snippet)) {
-            results.push({
-              title: snippet.slice(0, 120),
-              text: snippet,
-              url: window.location.href,
-            });
-          }
-        }
-      }
-
-      return results;
-    },
-    {
-      minPostcode: MIN_POSTCODE,
-      maxPostcode: MAX_POSTCODE,
-    }
-  );
-
-  return dedupeListings(rawListings);
-}
-
 function buildListingsMessage(title, listings) {
   const lines = [
     title,
@@ -328,9 +518,9 @@ function buildListingsMessage(title, listings) {
   ];
 
   listings.forEach((listing, index) => {
-    lines.push(`━━━━━━━━━━━━━━━━━━━━`);
+    lines.push("━━━━━━━━━━━━━━━━━━━━");
     lines.push(`${index + 1}. ${listing.title}`);
-    lines.push(`Postcode(s): ${listing.postcodes.join(", ")}`);
+    lines.push(`Postcode: ${listing.postcode} ${listing.city}`);
     lines.push("");
 
     const shortText = normalizeText(listing.text).slice(0, 1200);
@@ -356,7 +546,7 @@ function buildEmptyFirstRunMessage() {
   return [
     "✅ DAB-Lejerbo apartment watcher is running",
     "",
-    `First snapshot completed.`,
+    "First snapshot completed.",
     `Postcode range: ${MIN_POSTCODE}-${MAX_POSTCODE}`,
     "",
     "Found 0 matching listings on the page right now.",
@@ -439,6 +629,22 @@ async function sendTelegramMessage(message) {
   console.log(`Telegram message sent in ${chunks.length} part(s).`);
 }
 
+async function acceptCookies(page) {
+  for (const label of [
+    "Accepter",
+    "Acceptér",
+    "Tillad alle",
+    "OK",
+    "Accept all",
+    "Allow all",
+  ]) {
+    await page
+      .getByRole("button", { name: new RegExp(label, "i") })
+      .click({ timeout: 1500 })
+      .catch(() => {});
+  }
+}
+
 async function main() {
   const browser = await chromium.launch({ headless: true });
 
@@ -460,31 +666,46 @@ async function main() {
     await page.waitForLoadState("networkidle", { timeout: 30000 }).catch(() => {});
     await page.waitForTimeout(5000);
 
-    for (const label of [
-      "Accepter",
-      "Acceptér",
-      "Tillad alle",
-      "OK",
-      "Accept all",
-      "Allow all",
-    ]) {
-      await page
-        .getByRole("button", { name: new RegExp(label, "i") })
-        .click({ timeout: 1500 })
-        .catch(() => {});
-    }
+    await acceptCookies(page);
 
     await page.waitForTimeout(3000);
 
     /*
-      Scroll down and up to trigger lazy-loaded content.
+      Scroll to trigger lazy-loaded content.
     */
-    await page.mouse.wheel(0, 1800).catch(() => {});
+    await page.mouse.wheel(0, 2200).catch(() => {});
     await page.waitForTimeout(1500);
-    await page.mouse.wheel(0, -1800).catch(() => {});
+    await page.mouse.wheel(0, 2200).catch(() => {});
+    await page.waitForTimeout(1500);
+    await page.mouse.wheel(0, -4400).catch(() => {});
     await page.waitForTimeout(1500);
 
-    const listings = await extractListingsFromPage(page);
+    const bodyText = await page
+      .locator("body")
+      .innerText({ timeout: 15000 })
+      .catch(async () => page.content());
+
+    /*
+      TEST MODE:
+      Sends all available real-looking postcode/city pairs and exits.
+      This is what you should run first.
+    */
+    if (POSTCODE_TEST) {
+      console.log("POSTCODE_TEST=1 enabled. Sending postcode-only test.");
+
+      const postcodeItems = extractAvailablePostcodesFromText(bodyText);
+
+      console.log(
+        "Strict postcode/city matches:",
+        postcodeItems.map((item) => `${item.postcode} ${item.city}`).join(", ")
+      );
+
+      await sendTelegramMessage(buildPostcodeTestMessage(postcodeItems));
+
+      return;
+    }
+
+    const listings = extractListingsFromText(bodyText);
 
     console.log(
       `Matching listings in postcode range ${MIN_POSTCODE}-${MAX_POSTCODE}: ${listings.length}`
@@ -497,8 +718,8 @@ async function main() {
 
     /*
       FIRST RUN:
-      Send everything found.
-      If nothing is found, still send a Telegram message so you know the bot works.
+      Send all listings found in the target postcode range.
+      If none are found, still send a Telegram message so we know the bot works.
     */
     if (isInitialSnapshot) {
       console.log("Initial snapshot mode: sending all current matching listings.");
@@ -532,7 +753,7 @@ async function main() {
 
     /*
       NEXT RUNS:
-      Only send listings that were not seen before.
+      Send only new listings.
     */
     if (listings.length === 0) {
       console.log("No matching listings found. No Telegram message sent.");
@@ -544,10 +765,6 @@ async function main() {
 
     if (newListings.length === 0) {
       console.log("No new matching listings. No Telegram message sent.");
-
-      /*
-        Save current state again, keeping the new state format.
-      */
       saveState(state.seenIds, true);
       return;
     }
