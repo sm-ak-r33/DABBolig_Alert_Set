@@ -7,6 +7,7 @@ const DEFAULT_APARTMENT_URL =
   "https://dab-lejerbo.dk/boligsoegende/tidsbegraensede-boliger/";
 
 const APARTMENT_URL = process.env.APARTMENT_URL || DEFAULT_APARTMENT_URL;
+
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 
@@ -38,6 +39,7 @@ function extractPostcodes(text) {
 
   while ((match = regex.exec(String(text || ""))) !== null) {
     const postcode = Number(match[1]);
+
     if (postcode >= MIN_POSTCODE && postcode <= MAX_POSTCODE) {
       matches.push(postcode);
     }
@@ -79,11 +81,20 @@ function titleFromText(text) {
 }
 
 function makeListingId(listing) {
-  const stablePart = listing.url
-    ? `${listing.url}|${listing.postcodes.join(",")}`
-    : `${listing.title}|${listing.postcodes.join(",")}|${listing.text}`;
+  /*
+    IMPORTANT:
+    Do NOT only use url + postcode.
+    DAB/Lejerbo can show multiple listings from the same generic page URL,
+    so url + postcode can accidentally hide a new apartment.
+  */
+  const stablePart = [
+    listing.title,
+    listing.postcodes.join(","),
+    normalizeText(listing.text).slice(0, 1200),
+    listing.url || APARTMENT_URL,
+  ].join("|");
 
-  return hash(stablePart);
+  return hash(stablePart.toLowerCase());
 }
 
 function loadSeenIds() {
@@ -129,7 +140,7 @@ function saveSeenIds(seenIds) {
 }
 
 function dedupeListings(rawListings) {
-  const byKey = new Map();
+  const byId = new Map();
 
   for (const raw of rawListings) {
     const text = normalizeText(raw.text);
@@ -146,19 +157,16 @@ function dedupeListings(rawListings) {
       postcodes,
     };
 
-    const key = listing.url
-      ? `${listing.url}|${listing.postcodes.join(",")}`.toLowerCase()
-      : `${listing.title}|${listing.postcodes.join(",")}`.toLowerCase();
+    listing.id = makeListingId(listing);
 
-    const existing = byKey.get(key);
+    const existing = byId.get(listing.id);
 
     if (!existing || listing.text.length > existing.text.length) {
-      listing.id = makeListingId(listing);
-      byKey.set(key, listing);
+      byId.set(listing.id, listing);
     }
   }
 
-  return [...byKey.values()];
+  return [...byId.values()];
 }
 
 async function extractListingsFromPage(page) {
@@ -174,6 +182,7 @@ async function extractListingsFromPage(page) {
 
         while ((match = regex.exec(String(text || ""))) !== null) {
           const postcode = Number(match[1]);
+
           if (postcode >= minPostcode && postcode <= maxPostcode) {
             return true;
           }
@@ -193,7 +202,7 @@ async function extractListingsFromPage(page) {
           return false;
         }
 
-        return /bolig|lejemål|lejlighed|værelse|rum|m2|m²|husleje|kr\.?|indskud|overtagelse|adresse|tidsbegrænset/i.test(
+        return /bolig|lejemål|lejlighed|værelse|rum|m2|m²|husleje|kr\.?|indskud|depositum|overtagelse|adresse|tidsbegrænset|fleksible regler|udlejning/i.test(
           value
         );
       }
@@ -209,9 +218,7 @@ async function extractListingsFromPage(page) {
       const root = document.querySelector("main") || document.body;
 
       const nodes = [
-        ...root.querySelectorAll(
-          "article, li, a[href], div, section, [class]"
-        ),
+        ...root.querySelectorAll("article, li, a[href], div, section, [class]"),
       ];
 
       const results = [];
@@ -228,10 +235,9 @@ async function extractListingsFromPage(page) {
           continue;
         }
 
-        const anchor =
-          usefulNode.matches("a[href]")
-            ? usefulNode
-            : usefulNode.querySelector("a[href]");
+        const anchor = usefulNode.matches("a[href]")
+          ? usefulNode
+          : usefulNode.querySelector("a[href]");
 
         const href = anchor ? anchor.getAttribute("href") : "";
         const url = href ? new URL(href, window.location.href).href : "";
@@ -266,7 +272,8 @@ function buildTelegramMessage(newListings) {
     lines.push(`${index + 1}. ${listing.title}`);
     lines.push(`Postcode(s): ${listing.postcodes.join(", ")}`);
 
-    const shortText = normalizeText(listing.text).slice(0, 350);
+    const shortText = normalizeText(listing.text).slice(0, 700);
+
     if (shortText) {
       lines.push(shortText);
     }
@@ -370,28 +377,30 @@ async function main() {
 
     const seenIds = loadSeenIds();
 
-    if (seenIds.size === 0) {
-      for (const listing of listings) {
-        seenIds.add(listing.id);
-      }
+    /*
+      FIX:
+      The old version skipped Telegram when seenIds was empty.
+      That caused the exact problem you saw:
+      the first detected housing was saved as "seen" without alerting.
 
-      saveSeenIds(seenIds);
-
-      console.log(
-        "First run with this state file. Saved existing matching listings without sending Telegram message."
-      );
-
-      return;
-    }
-
-    const newListings = listings.filter((listing) => !seenIds.has(listing.id));
+      Now:
+      - If state is empty, all current matching listings are treated as new.
+      - If state exists, only unseen listings are sent.
+    */
+    const newListings =
+      seenIds.size === 0
+        ? listings
+        : listings.filter((listing) => !seenIds.has(listing.id));
 
     if (newListings.length === 0) {
       console.log("No new matching listings. No Telegram message sent.");
       return;
     }
 
+    console.log(`New listings to alert: ${newListings.length}`);
+
     const message = buildTelegramMessage(newListings);
+
     await sendTelegramMessage(message);
 
     for (const listing of listings) {
