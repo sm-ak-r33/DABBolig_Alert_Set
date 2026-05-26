@@ -49,8 +49,10 @@ jobs:
           APARTMENT_URL: https://dab-lejerbo.dk/boligsoegende/tidsbegraensede-boliger/
           MIN_POSTCODE: "1000"
           MAX_POSTCODE: "2999"
+          FORGET_AFTER_MISSING_RUNS: "3"
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
         run: npm run check
 
       - name: Save alert state

@@ -11,15 +11,21 @@ const APARTMENT_URL = process.env.APARTMENT_URL || DEFAULT_APARTMENT_URL;
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 
+const SLACK_WEBHOOK_URL = process.env.SLACK_WEBHOOK_URL;
+
 const MIN_POSTCODE = Number(process.env.MIN_POSTCODE || 1000);
 const MAX_POSTCODE = Number(process.env.MAX_POSTCODE || 2999);
 
 const POSTCODE_TEST = process.env.POSTCODE_TEST === "1";
 const FORCE_INITIAL_SNAPSHOT = process.env.FORCE_INITIAL_SNAPSHOT === "1";
 
+const FORGET_AFTER_MISSING_RUNS = Number(
+  process.env.FORGET_AFTER_MISSING_RUNS || 3
+);
+
 const STATE_DIR = ".state";
 const STATE_FILE = path.join(STATE_DIR, "seen-housing-ids.json");
-const STATE_VERSION = 3;
+const STATE_VERSION = 4;
 
 function hash(value) {
   return crypto.createHash("sha256").update(String(value)).digest("hex");
@@ -41,16 +47,15 @@ function isInTargetRange(postcode) {
 }
 
 /*
-  IMPORTANT:
-  This is the new strict postcode extractor.
+  Strict postcode extractor.
 
-  It only accepts a postcode when it looks like:
+  Accepts:
     2635 Ishøj Husleje...
     2830 Virum Husleje...
     3460 Birkerød Husleje...
     4700 Næstved Husleje...
 
-  It does NOT accept:
+  Rejects:
     2026 – 2027
     15-05-2026
     31-10-2027
@@ -123,11 +128,6 @@ function extractPostcodeCityAnchors(pageText) {
       Math.min(text.length, match.index + 120)
     );
 
-    /*
-      Extra guard:
-      If the postcode candidate is directly inside rental-period/date text,
-      ignore it.
-    */
     const looksLikeDateContext =
       /Udlejningsperiode|Rental period|Lejeperiode/i.test(before) &&
       /\d{1,2}[./-]\d{1,2}[./-]\d{4}|\d{4}\s*[–-]\s*\d{1,2}|\d{4}\s*(til|to|until)/i.test(
@@ -152,6 +152,7 @@ function extractPostcodeCityAnchors(pageText) {
 function extractAvailablePostcodesFromText(pageText) {
   const anchors = extractPostcodeCityAnchors(pageText);
   const byKey = new Map();
+  const text = normalizeText(pageText);
 
   for (const anchor of anchors) {
     const key = `${anchor.postcode} ${anchor.city}`;
@@ -169,7 +170,6 @@ function extractAvailablePostcodesFromText(pageText) {
     item.count += 1;
 
     if (item.examples.length < 2) {
-      const text = normalizeText(pageText);
       const example = text.slice(anchor.index, anchor.index + 240);
       item.examples.push(example);
     }
@@ -185,7 +185,9 @@ function extractAvailablePostcodesFromText(pageText) {
 }
 
 function buildPostcodeTestMessage(postcodeItems) {
-  const inRangeItems = postcodeItems.filter((item) => isInTargetRange(item.postcode));
+  const inRangeItems = postcodeItems.filter((item) =>
+    isInTargetRange(item.postcode)
+  );
 
   const lines = [
     "🧪 DAB-Lejerbo postcode extraction test",
@@ -262,7 +264,7 @@ function titleFromText(text) {
 }
 
 function guessListingStart(text, postcodeIndex) {
-  const searchStart = Math.max(0, postcodeIndex - 260);
+  const searchStart = Math.max(0, postcodeIndex - 300);
   const before = text.slice(searchStart, postcodeIndex);
 
   const boundaryPatterns = [
@@ -290,12 +292,9 @@ function guessListingStart(text, postcodeIndex) {
   if (bestLocalIndex >= 0) {
     let absolute = searchStart + bestLocalIndex + bestBoundary.length;
 
-    /*
-      After a previous rental period, skip a likely date tail before the next address.
-    */
     const tail = text.slice(absolute, postcodeIndex);
     const dateTailMatch = tail.match(
-      /(?:\d{1,2}[./-]\d{1,2}[./-]\d{4}|\d{1,2}\.\s*[A-Za-zÆØÅæøå]+\s+\d{4}|\d{4})[^A-Za-zÆØÅæøå]{0,20}/
+      /(?:\d{1,2}[./-]\d{1,2}[./-]\d{4}|\d{1,2}\.\s*[A-Za-zÆØÅæøå]+\s+\d{4}|\d{4})[^A-Za-zÆØÅæøå]{0,30}/
     );
 
     if (dateTailMatch && dateTailMatch.index !== undefined) {
@@ -309,26 +308,7 @@ function guessListingStart(text, postcodeIndex) {
     return Math.max(0, absolute);
   }
 
-  /*
-    Fallback: start a bit before postcode so the address is included.
-  */
   return searchStart;
-}
-
-function guessListingEnd(text, nextPostcodeIndex) {
-  if (nextPostcodeIndex === -1) {
-    const readMore = text.indexOf(
-      "Læs mere og se billeder af afdelingen",
-      nextPostcodeIndex
-    );
-
-    return readMore >= 0 ? readMore : text.length;
-  }
-
-  /*
-    End before the next listing's address.
-  */
-  return Math.max(0, nextPostcodeIndex - 180);
 }
 
 function extractTitleFromListing(listingText, postcode, city) {
@@ -341,7 +321,10 @@ function extractTitleFromListing(listingText, postcode, city) {
 
     const cleaned = beforePostcode
       .replace(/^[-–—.,\s]+/, "")
-      .replace(/^(Læs mere og se billeder af afdelingen|Read more and see pictures of the department)\s*/i, "")
+      .replace(
+        /^(Læs mere og se billeder af afdelingen|Read more and see pictures of the department)\s*/i,
+        ""
+      )
       .trim();
 
     if (cleaned.length >= 5) {
@@ -366,6 +349,7 @@ function makeListingId(listing) {
 
 function extractListingsFromText(pageText) {
   const text = normalizeText(pageText);
+
   const anchors = extractPostcodeCityAnchors(text)
     .filter((anchor) => isInTargetRange(anchor.postcode))
     .sort((a, b) => a.index - b.index);
@@ -381,9 +365,6 @@ function extractListingsFromText(pageText) {
 
     let listingText = normalizeText(text.slice(start, end));
 
-    /*
-      Stop after "Læs mere..." when the next department begins.
-    */
     const readMorePatterns = [
       "Læs mere og se billeder af afdelingen",
       "Read more and see pictures of the department",
@@ -421,9 +402,6 @@ function extractListingsFromText(pageText) {
     rawListings.push(listing);
   }
 
-  /*
-    Dedupe by ID.
-  */
   const byId = new Map();
 
   for (const listing of rawListings) {
@@ -437,19 +415,11 @@ function extractListingsFromText(pageText) {
   return [...byId.values()];
 }
 
-async function extractListingsFromPage(page) {
-  const bodyText = await page
-    .locator("body")
-    .innerText({ timeout: 15000 })
-    .catch(async () => page.content());
-
-  return extractListingsFromText(bodyText);
-}
-
 function loadState() {
   if (!fs.existsSync(STATE_FILE)) {
     return {
       seenIds: new Set(),
+      missingCounts: {},
       hasSentInitialSnapshot: false,
     };
   }
@@ -461,6 +431,7 @@ function loadState() {
     if (Array.isArray(parsed)) {
       return {
         seenIds: new Set(parsed),
+        missingCounts: {},
         hasSentInitialSnapshot: false,
       };
     }
@@ -468,6 +439,7 @@ function loadState() {
     if (Array.isArray(parsed.seenIds)) {
       return {
         seenIds: new Set(parsed.seenIds),
+        missingCounts: parsed.missingCounts || {},
         hasSentInitialSnapshot:
           parsed.stateVersion === STATE_VERSION &&
           parsed.hasSentInitialSnapshot === true,
@@ -476,6 +448,7 @@ function loadState() {
 
     return {
       seenIds: new Set(),
+      missingCounts: {},
       hasSentInitialSnapshot: false,
     };
   } catch (error) {
@@ -483,12 +456,13 @@ function loadState() {
 
     return {
       seenIds: new Set(),
+      missingCounts: {},
       hasSentInitialSnapshot: false,
     };
   }
 }
 
-function saveState(seenIds, hasSentInitialSnapshot) {
+function saveState(seenIds, missingCounts, hasSentInitialSnapshot) {
   fs.mkdirSync(STATE_DIR, { recursive: true });
 
   const ids = [...seenIds].slice(-2000);
@@ -500,12 +474,43 @@ function saveState(seenIds, hasSentInitialSnapshot) {
         stateVersion: STATE_VERSION,
         updatedAt: new Date().toISOString(),
         hasSentInitialSnapshot,
+        forgetAfterMissingRuns: FORGET_AFTER_MISSING_RUNS,
         seenIds: ids,
+        missingCounts,
       },
       null,
       2
     )
   );
+}
+
+function updateMemoryWithCurrentListings(state, currentListings) {
+  const currentIds = new Set(currentListings.map((listing) => listing.id));
+  const nextSeenIds = new Set(state.seenIds);
+  const nextMissingCounts = { ...state.missingCounts };
+
+  for (const id of currentIds) {
+    nextSeenIds.add(id);
+    delete nextMissingCounts[id];
+  }
+
+  for (const id of state.seenIds) {
+    if (!currentIds.has(id)) {
+      const missingCount = (nextMissingCounts[id] || 0) + 1;
+      nextMissingCounts[id] = missingCount;
+
+      if (missingCount >= FORGET_AFTER_MISSING_RUNS) {
+        nextSeenIds.delete(id);
+        delete nextMissingCounts[id];
+        console.log(`Forgot listing after ${missingCount} missing runs: ${id}`);
+      }
+    }
+  }
+
+  return {
+    seenIds: nextSeenIds,
+    missingCounts: nextMissingCounts,
+  };
 }
 
 function buildListingsMessage(title, listings) {
@@ -551,14 +556,14 @@ function buildEmptyFirstRunMessage() {
     "",
     "Found 0 matching listings on the page right now.",
     "",
-    "This means Telegram works, but the scraper/page did not return any matching apartment details in this run.",
+    "This means Telegram/Slack works, but the scraper/page did not return any matching apartment details in this run.",
     "",
     "Source:",
     APARTMENT_URL,
   ].join("\n");
 }
 
-function splitTelegramMessage(message, maxLength = 3800) {
+function splitMessage(message, maxLength = 3800) {
   if (message.length <= maxLength) {
     return [message];
   }
@@ -590,12 +595,11 @@ function splitTelegramMessage(message, maxLength = 3800) {
 
 async function sendTelegramMessage(message) {
   if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
-    console.log("Telegram credentials missing. Would have sent:");
-    console.log(message);
-    return;
+    console.log("Telegram credentials missing. Skipping Telegram message.");
+    return false;
   }
 
-  const chunks = splitTelegramMessage(message);
+  const chunks = splitMessage(message, 3800);
 
   for (let i = 0; i < chunks.length; i += 1) {
     const text =
@@ -627,6 +631,74 @@ async function sendTelegramMessage(message) {
   }
 
   console.log(`Telegram message sent in ${chunks.length} part(s).`);
+  return true;
+}
+
+async function sendSlackMessage(message) {
+  if (!SLACK_WEBHOOK_URL) {
+    console.log("Slack webhook missing. Skipping Slack message.");
+    return false;
+  }
+
+  const chunks = splitMessage(message, 3500);
+
+  for (let i = 0; i < chunks.length; i += 1) {
+    const text =
+      chunks.length === 1
+        ? chunks[i]
+        : `${chunks[i]}\n\nPart ${i + 1}/${chunks.length}`;
+
+    const response = await fetch(SLACK_WEBHOOK_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        text,
+      }),
+    });
+
+    const resultText = await response.text();
+
+    if (!response.ok || resultText.trim() !== "ok") {
+      console.error("Slack response:", response.status, resultText);
+      throw new Error("Slack message failed.");
+    }
+  }
+
+  console.log(`Slack message sent in ${chunks.length} part(s).`);
+  return true;
+}
+
+async function sendNotifications(message) {
+  const errors = [];
+  let sentAtLeastOne = false;
+
+  try {
+    const sentTelegram = await sendTelegramMessage(message);
+    sentAtLeastOne = sentAtLeastOne || sentTelegram;
+  } catch (error) {
+    errors.push(error);
+    console.error("Telegram notification failed:", error);
+  }
+
+  try {
+    const sentSlack = await sendSlackMessage(message);
+    sentAtLeastOne = sentAtLeastOne || sentSlack;
+  } catch (error) {
+    errors.push(error);
+    console.error("Slack notification failed:", error);
+  }
+
+  if (!sentAtLeastOne) {
+    if (errors.length > 0) {
+      throw new Error("All configured notification channels failed.");
+    }
+
+    throw new Error(
+      "No notification channels configured. Add Telegram secrets and/or SLACK_WEBHOOK_URL."
+    );
+  }
 }
 
 async function acceptCookies(page) {
@@ -670,9 +742,6 @@ async function main() {
 
     await page.waitForTimeout(3000);
 
-    /*
-      Scroll to trigger lazy-loaded content.
-    */
     await page.mouse.wheel(0, 2200).catch(() => {});
     await page.waitForTimeout(1500);
     await page.mouse.wheel(0, 2200).catch(() => {});
@@ -685,11 +754,6 @@ async function main() {
       .innerText({ timeout: 15000 })
       .catch(async () => page.content());
 
-    /*
-      TEST MODE:
-      Sends all available real-looking postcode/city pairs and exits.
-      This is what you should run first.
-    */
     if (POSTCODE_TEST) {
       console.log("POSTCODE_TEST=1 enabled. Sending postcode-only test.");
 
@@ -700,7 +764,7 @@ async function main() {
         postcodeItems.map((item) => `${item.postcode} ${item.city}`).join(", ")
       );
 
-      await sendTelegramMessage(buildPostcodeTestMessage(postcodeItems));
+      await sendNotifications(buildPostcodeTestMessage(postcodeItems));
 
       return;
     }
@@ -716,17 +780,16 @@ async function main() {
     const isInitialSnapshot =
       FORCE_INITIAL_SNAPSHOT || state.hasSentInitialSnapshot === false;
 
-    /*
-      FIRST RUN:
-      Send all listings found in the target postcode range.
-      If none are found, still send a Telegram message so we know the bot works.
-    */
     if (isInitialSnapshot) {
       console.log("Initial snapshot mode: sending all current matching listings.");
 
       if (listings.length === 0) {
-        await sendTelegramMessage(buildEmptyFirstRunMessage());
-        saveState(state.seenIds, true);
+        await sendNotifications(buildEmptyFirstRunMessage());
+
+        const updatedMemory = updateMemoryWithCurrentListings(state, listings);
+
+        saveState(updatedMemory.seenIds, updatedMemory.missingCounts, true);
+
         console.log("Saved initial snapshot state with 0 listings.");
         return;
       }
@@ -736,36 +799,38 @@ async function main() {
         listings
       );
 
-      await sendTelegramMessage(message);
+      await sendNotifications(message);
 
-      for (const listing of listings) {
-        state.seenIds.add(listing.id);
-      }
+      const updatedMemory = updateMemoryWithCurrentListings(state, listings);
 
-      saveState(state.seenIds, true);
+      saveState(updatedMemory.seenIds, updatedMemory.missingCounts, true);
 
       console.log(
-        `Initial snapshot sent. Saved ${state.seenIds.size} seen listing id(s).`
+        `Initial snapshot sent. Saved ${updatedMemory.seenIds.size} seen listing id(s).`
       );
 
       return;
     }
 
-    /*
-      NEXT RUNS:
-      Send only new listings.
-    */
     if (listings.length === 0) {
-      console.log("No matching listings found. No Telegram message sent.");
-      saveState(state.seenIds, true);
+      console.log("No matching listings found. No Telegram/Slack message sent.");
+
+      const updatedMemory = updateMemoryWithCurrentListings(state, listings);
+
+      saveState(updatedMemory.seenIds, updatedMemory.missingCounts, true);
+
       return;
     }
 
     const newListings = listings.filter((listing) => !state.seenIds.has(listing.id));
 
     if (newListings.length === 0) {
-      console.log("No new matching listings. No Telegram message sent.");
-      saveState(state.seenIds, true);
+      console.log("No new matching listings. No Telegram/Slack message sent.");
+
+      const updatedMemory = updateMemoryWithCurrentListings(state, listings);
+
+      saveState(updatedMemory.seenIds, updatedMemory.missingCounts, true);
+
       return;
     }
 
@@ -776,15 +841,13 @@ async function main() {
       newListings
     );
 
-    await sendTelegramMessage(message);
+    await sendNotifications(message);
 
-    for (const listing of listings) {
-      state.seenIds.add(listing.id);
-    }
+    const updatedMemory = updateMemoryWithCurrentListings(state, listings);
 
-    saveState(state.seenIds, true);
+    saveState(updatedMemory.seenIds, updatedMemory.missingCounts, true);
 
-    console.log(`Saved ${state.seenIds.size} seen listing id(s).`);
+    console.log(`Saved ${updatedMemory.seenIds.size} seen listing id(s).`);
   } finally {
     await browser.close();
   }
