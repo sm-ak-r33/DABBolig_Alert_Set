@@ -40,7 +40,10 @@ jobs:
 
       - name: Install Playwright Chromium
         run: npx playwright install --with-deps chromium
-
+      - name: Ensure Waitly state directory exists
+        run: |
+          mkdir -p .state
+          touch .state/.keep
       - name: Check Waitly availability
         env:
           WAITLY_URL: https://waitly.eu/da/soegning?search=Copenhagen,+Danmark&address=d52cbf2048515d4feeac41b96c9e926390ab4f8d3fb4e0b10088c218b87926a180db958f167b69f899b6e68616b10389&type=rental_housing
