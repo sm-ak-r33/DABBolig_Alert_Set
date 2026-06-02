@@ -3,7 +3,8 @@
   "version": "1.0.0",
   "private": true,
   "scripts": {
-    "check": "node src/check-apartments.js"
+    "check": "node src/check-apartments.js",
+    "check:waitly": "node src/check-waitly.js"
   },
   "dependencies": {
     "playwright": "^1.56.0",
