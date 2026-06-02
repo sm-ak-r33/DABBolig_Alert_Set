@@ -46,6 +46,7 @@ jobs:
           WAITLY_URL: https://waitly.eu/da/soegning?search=Copenhagen,+Danmark&address=d52cbf2048515d4feeac41b96c9e926390ab4f8d3fb4e0b10088c218b87926a180db958f167b69f899b6e68616b10389&type=rental_housing
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          ALERT_ON_FIRST_RUN: "true"
         run: npm run check:waitly
 
       - name: Save Waitly alert state
